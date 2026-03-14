@@ -1,0 +1,11 @@
+{
+  "large": {
+    "samples": 30,
+    "successes": 30,
+    "failures": 0,
+    "mean_inference_time_sec": 10.556369988966669,
+    "mean_rtf": 1.5628423668922546,
+    "mean_wer": 0.2688384824096898,
+    "peak_memory_mb": 7654.296875
+  }
+}

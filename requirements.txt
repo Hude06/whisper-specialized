@@ -1,0 +1,6 @@
+datasets<4
+jiwer
+psutil
+matplotlib
+numpy
+pandas
