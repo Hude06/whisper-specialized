@@ -2,7 +2,9 @@ from datasets import Audio, load_dataset
 import os
 import csv
 import urllib.request
+import urllib.error
 import shutil
+import time
 
 WHISPER_MODEL_NAMES = (
     "tiny",
@@ -10,8 +12,8 @@ WHISPER_MODEL_NAMES = (
 )
 
 GGML_MODEL_URLS = {
-    "tiny": "https://ggml.ggerganov.com/ggml-model-whisper-tiny.bin",
-    "large": "https://ggml.ggerganov.com/ggml-model-whisper-large.bin",
+    "tiny": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
+    "large": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
 }
 
 
@@ -19,18 +21,39 @@ def _duration_seconds(row: dict, sampling_rate: int) -> float:
     return row["num_samples"] / float(sampling_rate)
 
 
-def _download_file(url: str, dest_path: str):
-    """Download a file from URL to destination with progress."""
+def _download_file(url: str, dest_path: str, timeout: int = 60, retries: int = 3):
+    """Download a file from URL to destination with progress and retries."""
     print(f"Downloading {url}...")
     print(f"Destination: {dest_path}")
 
-    def report_hook(block_num, block_size, total_size):
-        downloaded = block_num * block_size
-        percent = min(downloaded * 100 / total_size, 100) if total_size > 0 else 0
-        print(f"\rProgress: {percent:.1f}%", end="", flush=True)
-
-    urllib.request.urlretrieve(url, dest_path, reporthook=report_hook)
-    print("\nDownload complete!")
+    temp_path = f"{dest_path}.part"
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                total_size = int(response.headers.get("Content-Length", "0"))
+                downloaded = 0
+                with open(temp_path, "wb") as output_file:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output_file.write(chunk)
+                        downloaded += len(chunk)
+                        percent = min(downloaded * 100 / total_size, 100) if total_size > 0 else 0
+                        print(f"\rProgress: {percent:.1f}%", end="", flush=True)
+            os.replace(temp_path, dest_path)
+            print("\nDownload complete!")
+            return
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            if attempt == retries:
+                raise RuntimeError(
+                    f"Failed to download {url} after {retries} attempts: {exc}"
+                ) from exc
+            wait_seconds = attempt * 2
+            print(f"\nDownload attempt {attempt} failed: {exc}. Retrying in {wait_seconds}s...")
+            time.sleep(wait_seconds)
 
 
 def download_whisper_model(model_name: str, out_dir: str = "whisper_models"):
@@ -42,7 +65,8 @@ def download_whisper_model(model_name: str, out_dir: str = "whisper_models"):
         )
 
     os.makedirs(out_dir, exist_ok=True)
-    model_path = os.path.join(out_dir, f"ggml-model-whisper-{model_name}.bin")
+    model_filename = os.path.basename(GGML_MODEL_URLS[model_name])
+    model_path = os.path.join(out_dir, model_filename)
 
     if os.path.exists(model_path):
         print(f"Model {model_name} already exists at {model_path}")
@@ -91,7 +115,7 @@ def cleanup_old_whisper_models(out_dir: str = "whisper_models"):
 
 TOP_10_SPOKEN_LANGUAGES = (
     "cmn_hans_cn",  # Mandarin Chinese (~1.1 billion)
-    "es_es",  # Spanish (~500 million)
+    "es_419",  # Spanish (~500 million)
     "en_us",  # English (~375 million)
     "hi_in",  # Hindi (~350 million)
     "ar_eg",  # Arabic (~310 million)
@@ -111,7 +135,19 @@ def download_fleurs_samples(
     n_samples: int = 30,
     out_dir: str = "fleurs_samples",
     seed: int = 42,
+    force_redownload: bool = False,
 ):
+    lang_dir = os.path.join(out_dir, lang_code, split)
+    manifest_path = os.path.join(lang_dir, "manifest.csv")
+    if not force_redownload and os.path.exists(manifest_path):
+        with open(manifest_path, newline="", encoding="utf-8") as existing_file:
+            row_count = sum(1 for _ in csv.DictReader(existing_file))
+        if row_count >= n_samples:
+            print(f"Using existing samples for {lang_code} {split} at {manifest_path}")
+            return None, manifest_path
+
+    print(f"Preparing samples for {lang_code} {split}...")
+
     # Load one FLEURS language config
     try:
         ds = load_dataset(
@@ -155,10 +191,8 @@ def download_fleurs_samples(
     ds = ds.shuffle(seed=seed).select(range(n_samples))
 
     # Save files
-    lang_dir = os.path.join(out_dir, lang_code, split)
     os.makedirs(lang_dir, exist_ok=True)
 
-    manifest_path = os.path.join(lang_dir, "manifest.csv")
     with open(manifest_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
@@ -206,6 +240,7 @@ def download_all_fleurs_samples(
     n_samples: int = 30,
     out_dir: str = "fleurs_samples",
     seed: int = 42,
+    force_redownload: bool = False,
 ):
     """Download FLEURS samples for all available languages."""
     results = {}
@@ -219,6 +254,7 @@ def download_all_fleurs_samples(
                 n_samples=n_samples,
                 out_dir=out_dir,
                 seed=seed,
+                force_redownload=force_redownload,
             )
             results[lang_code] = (ds, manifest_path)
         except ValueError as e:
@@ -234,5 +270,3 @@ if __name__ == "__main__":
         max_seconds=10,
         n_samples=30,
     )
-    download_whisper_tiny()
-    download_whisper_large()

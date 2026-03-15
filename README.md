@@ -47,7 +47,7 @@ That downloads 30 samples for the top 10 spoken languages from the `test` split 
 ```text
 fleurs_samples/
   cmn_hans_cn/test/
-  es_es/test/
+  es_419/test/
   en_us/test/
   hi_in/test/
   ar_eg/test/
@@ -60,6 +60,8 @@ fleurs_samples/
 
 Each folder will contain `.wav` files plus `manifest.csv`.
 
+If a language already has a `manifest.csv` with at least the requested number of rows, `python3 download.py` reuses those samples instead of downloading them again.
+
 ## Download Whisper Models
 
 This project uses **whisper.cpp** with GGML format models for fast inference on Apple Silicon (with Core ML acceleration).
@@ -67,25 +69,28 @@ This project uses **whisper.cpp** with GGML format models for fast inference on 
 Download the GGML models:
 
 ```bash
-python3 -c "from download import download_whisper_tiny; download_whisper_tiny()"
-python3 -c "from download import download_whisper_large; download_whisper_large()"
+python3 download_models.py --model tiny
+python3 download_models.py --model large
 ```
+
+`python3 download.py` does not download Whisper models. Dataset downloads and model downloads are separate commands.
 
 To download all supported models at once:
 
 ```bash
-python3 -c "from download import download_all_whisper_models; download_all_whisper_models()"
+python3 download_models.py
 ```
 
 Each model is stored as a `.bin` file under:
 
 ```text
 whisper_models/
-  ggml-model-whisper-tiny.bin
-  ggml-model-whisper-large.bin
+  ggml-tiny.bin
+  ggml-large-v3.bin
 ```
 
 **Note:** Old PyTorch models (`.pt` files) are automatically cleaned up when you run the new download functions.
+The model downloader uses the official `ggerganov/whisper.cpp` files on Hugging Face and retries transient network failures automatically.
 
 ## Run Benchmarks
 
