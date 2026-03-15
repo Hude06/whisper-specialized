@@ -22,7 +22,12 @@ import numpy as np
 import pandas as pd
 import psutil
 from jiwer import wer
-from download import WHISPER_MODEL_NAMES, download_whisper_model
+from config import (
+    DEFAULT_BENCHMARK_ROOT,
+    DEFAULT_MODELS_ROOT,
+    DEFAULT_SAMPLES_ROOT,
+)
+from whisper_cpp import WHISPER_MODEL_NAMES, ensure_whisper_model
 
 
 DURATION_BUCKETS = [
@@ -64,15 +69,18 @@ def _ensure_whisper_cli() -> None:
         )
 
 
-def _get_whisper_cpp_model_path(model_name: str, models_dir: str = "whisper_models") -> str:
-    """Resolve a GGML Whisper model path using the downloader as the source of truth."""
+def _get_whisper_cpp_model_path(
+    model_name: str,
+    models_dir: str = DEFAULT_MODELS_ROOT,
+) -> str:
+    """Resolve a whisper.cpp model path using the shared model catalog."""
     if model_name not in SUPPORTED_MODELS:
         supported = ", ".join(SUPPORTED_MODELS)
         raise ValueError(
             f"Unsupported model '{model_name}'. Supported models: {supported}."
         )
 
-    model_path = Path(download_whisper_model(model_name, out_dir=models_dir))
+    model_path = Path(ensure_whisper_model(model_name, models_root=models_dir))
     return str(model_path)
 
 
@@ -99,7 +107,13 @@ def _resolve_audio_path(base_dir: Path, audio_path: str) -> Path:
     audio_file = Path(audio_path)
     if audio_file.is_absolute():
         return audio_file
-    return (base_dir / audio_file).resolve()
+    manifest_relative = (base_dir / audio_file).resolve()
+    if manifest_relative.exists():
+        return manifest_relative
+    repo_relative = audio_file.resolve()
+    if repo_relative.exists():
+        return repo_relative
+    return manifest_relative
 
 
 def _monitor_peak_memory(
@@ -201,18 +215,34 @@ def _transcribe_with_metrics(model_path: str, audio_path: str) -> Dict[str, obje
 
 
 def _benchmark_manifest(
-    model_name: str, model_path: str, manifest_file: Path
+    model_name: str,
+    model_path: str,
+    manifest_file: Path,
+    completed_samples: int = 0,
+    total_samples: Optional[int] = None,
+    manifest_index: Optional[int] = None,
+    manifest_count: Optional[int] = None,
 ) -> List[BenchmarkResult]:
-    project_dir = manifest_file.parents[3]
     rows = _read_manifest(str(manifest_file))
     split = manifest_file.parent.name
     language = manifest_file.parent.parent.name
+    manifest_label = f"{language}/{split}"
+    audio_base_dir = manifest_file.parent
+
+    manifest_position = ""
+    if manifest_index is not None and manifest_count is not None:
+        manifest_position = f" {manifest_index}/{manifest_count}"
+    print(
+        f"[{model_name}] Manifest{manifest_position}: {manifest_label} "
+        f"({len(rows)} samples)",
+        flush=True,
+    )
 
     results: List[BenchmarkResult] = []
-    for row in rows:
+    for sample_number, row in enumerate(rows, start=1):
         audio_duration = float(row["duration_sec"])
         bucket = _duration_bucket(audio_duration)
-        audio_path = str(_resolve_audio_path(project_dir, row["audio_path"]))
+        audio_path = str(_resolve_audio_path(audio_base_dir, row["audio_path"]))
         reference = row["transcription"].strip()
 
         try:
@@ -258,13 +288,28 @@ def _benchmark_manifest(
             )
         )
 
+        overall_sample = completed_samples + sample_number
+        total_progress = (
+            f"/{total_samples}" if total_samples is not None else ""
+        )
+        inference_label = (
+            f"{inference_time:.2f}s" if inference_time is not None else "n/a"
+        )
+        status = "ok" if success else "failed"
+        print(
+            f"[{model_name}] Sample {overall_sample}{total_progress} "
+            f"({sample_number}/{len(rows)} in {manifest_label}) "
+            f"{status} in {inference_label}",
+            flush=True,
+        )
+
     return results
 
 
 def benchmark_model(
     model_name: str,
     manifest_paths: List[str],
-    models_dir: str = "whisper_models",
+    models_dir: str = DEFAULT_MODELS_ROOT,
 ) -> List[BenchmarkResult]:
     if model_name not in SUPPORTED_MODELS:
         supported = ", ".join(SUPPORTED_MODELS)
@@ -273,16 +318,63 @@ def benchmark_model(
         )
 
     model_path = _get_whisper_cpp_model_path(model_name, models_dir)
+    manifest_files = [Path(manifest_path).resolve() for manifest_path in manifest_paths]
+    sample_counts = [
+        len(_read_manifest(str(manifest_file))) for manifest_file in manifest_files
+    ]
+    total_samples = sum(sample_counts)
+
+    print(
+        f"[{model_name}] Starting benchmark across "
+        f"{len(manifest_files)} manifests and {total_samples} samples",
+        flush=True,
+    )
 
     results: List[BenchmarkResult] = []
-    for manifest_path in manifest_paths:
-        manifest_file = Path(manifest_path).resolve()
-        results.extend(_benchmark_manifest(model_name, model_path, manifest_file))
+    completed_samples = 0
+    for manifest_index, manifest_file in enumerate(manifest_files, start=1):
+        manifest_results = _benchmark_manifest(
+            model_name,
+            model_path,
+            manifest_file,
+            completed_samples=completed_samples,
+            total_samples=total_samples,
+            manifest_index=manifest_index,
+            manifest_count=len(manifest_files),
+        )
+        results.extend(manifest_results)
+        completed_samples += len(manifest_results)
+
+    print(
+        f"[{model_name}] Finished benchmark: {completed_samples}/{total_samples} "
+        "samples processed",
+        flush=True,
+    )
     return results
 
 
 def _results_to_dataframe(results: List[BenchmarkResult]) -> pd.DataFrame:
     return pd.DataFrame([result.__dict__ for result in results])
+
+
+def _write_model_outputs(
+    model_name: str,
+    results: List[BenchmarkResult],
+    output_root: str = DEFAULT_BENCHMARK_ROOT,
+) -> Path:
+    output_dir = Path(output_root) / model_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    results_df = _results_to_dataframe(results)
+    results_csv_path = output_dir / "benchmark_results.csv"
+    results_df.to_csv(results_csv_path, index=False)
+    _write_summary(output_dir / "summary.json", results_df)
+    _save_plots(results_df, output_dir)
+
+    print(f"[{model_name}] Wrote benchmark results to {results_csv_path}")
+    print(f"[{model_name}] Wrote summary to {output_dir / 'summary.json'}")
+    print(f"[{model_name}] Wrote plots to {output_dir}")
+    return output_dir
 
 
 def _efficiency_score(
@@ -517,8 +609,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--samples-root",
-        default="fleurs_samples",
-        help="Root directory to scan for manifest.csv files when --manifest is not provided.",
+        default=DEFAULT_SAMPLES_ROOT,
+        help=(
+            "Root directory to scan for manifest.csv files when --manifest is not "
+            f"provided. Default: {DEFAULT_SAMPLES_ROOT}."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -528,13 +623,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--models-dir",
-        default="whisper_models",
-        help="Directory containing per-model Whisper download roots.",
+        default=DEFAULT_MODELS_ROOT,
+        help=(
+            "Directory containing whisper.cpp model files. "
+            f"Default: {DEFAULT_MODELS_ROOT}."
+        ),
     )
     parser.add_argument(
         "--output-dir",
-        default="benchmark_results",
-        help="Directory for benchmark CSV, summary JSON, and plots.",
+        default=DEFAULT_BENCHMARK_ROOT,
+        help=(
+            "Benchmark output root. Each model writes to its own subdirectory under "
+            f"this folder. Default: {DEFAULT_BENCHMARK_ROOT}."
+        ),
     )
     return parser.parse_args()
 
@@ -551,28 +652,19 @@ def main() -> None:
         raise FileNotFoundError(
             f"No manifest.csv files found. Checked --samples-root={args.samples_root!r}."
         )
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    all_results: List[BenchmarkResult] = []
     for model_name in models:
-        all_results.extend(
-            benchmark_model(
-                model_name=model_name,
-                manifest_paths=manifest_paths,
-                models_dir=args.models_dir,
-            )
+        results = benchmark_model(
+            model_name=model_name,
+            manifest_paths=manifest_paths,
+            models_dir=args.models_dir,
         )
-
-    results_df = _results_to_dataframe(all_results)
-    results_csv_path = output_dir / "benchmark_results.csv"
-    results_df.to_csv(results_csv_path, index=False)
-    _write_summary(output_dir / "summary.json", results_df)
-    _save_plots(results_df, output_dir)
-
-    print(f"Wrote benchmark results to {results_csv_path}")
-    print(f"Wrote summary to {output_dir / 'summary.json'}")
-    print(f"Wrote plots to {output_dir}")
+        _write_model_outputs(
+            model_name=model_name,
+            results=results,
+            output_root=args.output_dir,
+        )
 
 
 if __name__ == "__main__":

@@ -1,158 +1,152 @@
-from datasets import Audio, load_dataset
-import os
+import argparse
 import csv
-import urllib.request
-import urllib.error
-import shutil
-import time
+import json
+from pathlib import Path
+from typing import Dict, Iterable, List
 
-WHISPER_MODEL_NAMES = (
-    "tiny",
-    "large",
+from datasets import Audio, load_dataset
+
+from config import (
+    DEFAULT_LANGUAGES,
+    DEFAULT_MAX_SECONDS,
+    DEFAULT_MIN_SECONDS,
+    DEFAULT_RANDOM_SEED,
+    DEFAULT_SAMPLE_COUNT,
+    DEFAULT_SAMPLES_ROOT,
+    DEFAULT_SPLIT,
+    DOWNLOAD_METADATA_FILENAME,
 )
-
-GGML_MODEL_URLS = {
-    "tiny": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
-    "large": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
-}
 
 
 def _duration_seconds(row: dict, sampling_rate: int) -> float:
     return row["num_samples"] / float(sampling_rate)
 
 
-def _download_file(url: str, dest_path: str, timeout: int = 60, retries: int = 3):
-    """Download a file from URL to destination with progress and retries."""
-    print(f"Downloading {url}...")
-    print(f"Destination: {dest_path}")
-
-    temp_path = f"{dest_path}.part"
-    for attempt in range(1, retries + 1):
-        try:
-            with urllib.request.urlopen(url, timeout=timeout) as response:
-                total_size = int(response.headers.get("Content-Length", "0"))
-                downloaded = 0
-                with open(temp_path, "wb") as output_file:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        output_file.write(chunk)
-                        downloaded += len(chunk)
-                        percent = min(downloaded * 100 / total_size, 100) if total_size > 0 else 0
-                        print(f"\rProgress: {percent:.1f}%", end="", flush=True)
-            os.replace(temp_path, dest_path)
-            print("\nDownload complete!")
-            return
-        except (urllib.error.URLError, TimeoutError) as exc:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            if attempt == retries:
-                raise RuntimeError(
-                    f"Failed to download {url} after {retries} attempts: {exc}"
-                ) from exc
-            wait_seconds = attempt * 2
-            print(f"\nDownload attempt {attempt} failed: {exc}. Retrying in {wait_seconds}s...")
-            time.sleep(wait_seconds)
+def _manifest_path(language: str, split: str, samples_root: str) -> Path:
+    return Path(samples_root) / language / split / "manifest.csv"
 
 
-def download_whisper_model(model_name: str, out_dir: str = "whisper_models"):
-    """Download a GGML Whisper model for use with whisper.cpp."""
-    if model_name not in WHISPER_MODEL_NAMES:
-        supported = ", ".join(WHISPER_MODEL_NAMES)
-        raise ValueError(
-            f"Unsupported Whisper model '{model_name}'. Supported models: {supported}."
-        )
-
-    os.makedirs(out_dir, exist_ok=True)
-    model_filename = os.path.basename(GGML_MODEL_URLS[model_name])
-    model_path = os.path.join(out_dir, model_filename)
-
-    if os.path.exists(model_path):
-        print(f"Model {model_name} already exists at {model_path}")
-        return model_path
-
-    url = GGML_MODEL_URLS[model_name]
-    _download_file(url, model_path)
-    return model_path
+def _metadata_path(language: str, split: str, samples_root: str) -> Path:
+    return Path(samples_root) / language / split / DOWNLOAD_METADATA_FILENAME
 
 
-def download_whisper_tiny(out_dir: str = "whisper_models"):
-    return download_whisper_model("tiny", out_dir=out_dir)
+def _expected_metadata(
+    language: str,
+    split: str,
+    sample_count: int,
+    min_seconds: float,
+    max_seconds: float,
+    seed: int,
+) -> Dict[str, object]:
+    return {
+        "dataset": "google/fleurs",
+        "language": language,
+        "split": split,
+        "sample_count": sample_count,
+        "min_seconds": min_seconds,
+        "max_seconds": max_seconds,
+        "seed": seed,
+    }
 
 
-def download_whisper_large(out_dir: str = "whisper_models"):
-    return download_whisper_model("large", out_dir=out_dir)
+def _read_manifest_rows(manifest_path: Path) -> List[Dict[str, str]]:
+    with open(manifest_path, newline="", encoding="utf-8") as manifest_file:
+        return list(csv.DictReader(manifest_file))
 
 
-def download_all_whisper_models(out_dir: str = "whisper_models"):
-    """Download all supported GGML Whisper models."""
-    downloads = {}
-    for model_name in WHISPER_MODEL_NAMES:
-        model_path = download_whisper_model(model_name, out_dir=out_dir)
-        downloads[model_name] = model_path
-    return downloads
+def _legacy_manifest_matches(
+    manifest_path: Path,
+    sample_count: int,
+    min_seconds: float,
+    max_seconds: float,
+) -> bool:
+    rows = _read_manifest_rows(manifest_path)
+    if len(rows) != sample_count:
+        return False
+    for row in rows:
+        duration_sec = float(row["duration_sec"])
+        if duration_sec < min_seconds or duration_sec > max_seconds:
+            return False
+    return True
 
 
-def cleanup_old_whisper_models(out_dir: str = "whisper_models"):
-    """Remove old PyTorch model files and directories."""
-    if not os.path.exists(out_dir):
-        return
+def _existing_download_matches(
+    language: str,
+    split: str,
+    sample_count: int,
+    min_seconds: float,
+    max_seconds: float,
+    seed: int,
+    samples_root: str,
+) -> bool:
+    manifest_path = _manifest_path(language, split, samples_root)
+    metadata_path = _metadata_path(language, split, samples_root)
+    if not manifest_path.exists():
+        return False
 
-    print(f"Cleaning up old models in {out_dir}...")
-    for item in os.listdir(out_dir):
-        item_path = os.path.join(out_dir, item)
-        # Remove directories (old PyTorch model folders)
-        if os.path.isdir(item_path):
-            print(f"Removing directory: {item_path}")
-            shutil.rmtree(item_path)
-        # Remove .pt files (old PyTorch models)
-        elif item.endswith(".pt"):
-            print(f"Removing file: {item_path}")
-            os.remove(item_path)
-    print("Cleanup complete!")
+    if metadata_path.exists():
+        with open(metadata_path, encoding="utf-8") as metadata_file:
+            metadata = json.load(metadata_file)
+        if metadata != _expected_metadata(
+            language=language,
+            split=split,
+            sample_count=sample_count,
+            min_seconds=min_seconds,
+            max_seconds=max_seconds,
+            seed=seed,
+        ):
+            return False
+        rows = _read_manifest_rows(manifest_path)
+        return len(rows) == sample_count
+
+    return _legacy_manifest_matches(
+        manifest_path=manifest_path,
+        sample_count=sample_count,
+        min_seconds=min_seconds,
+        max_seconds=max_seconds,
+    )
 
 
-TOP_10_SPOKEN_LANGUAGES = (
-    "cmn_hans_cn",  # Mandarin Chinese (~1.1 billion)
-    "es_419",  # Spanish (~500 million)
-    "en_us",  # English (~375 million)
-    "hi_in",  # Hindi (~350 million)
-    "ar_eg",  # Arabic (~310 million)
-    "pt_br",  # Portuguese (~230 million)
-    "bn_in",  # Bengali (~230 million)
-    "ru_ru",  # Russian (~155 million)
-    "ja_jp",  # Japanese (~125 million)
-    "pa_in",  # Punjabi (~95 million)
-)
+def _clear_existing_audio_files(target_dir: Path) -> None:
+    for wav_file in target_dir.glob("*.wav"):
+        wav_file.unlink()
 
 
 def download_fleurs_samples(
-    lang_code: str,
-    split: str = "test",
-    min_seconds: float = 3.0,
-    max_seconds: float = 6.0,
-    n_samples: int = 30,
-    out_dir: str = "fleurs_samples",
-    seed: int = 42,
+    language: str,
+    split: str = DEFAULT_SPLIT,
+    min_seconds: float = DEFAULT_MIN_SECONDS,
+    max_seconds: float = DEFAULT_MAX_SECONDS,
+    sample_count: int = DEFAULT_SAMPLE_COUNT,
+    samples_root: str = DEFAULT_SAMPLES_ROOT,
+    seed: int = DEFAULT_RANDOM_SEED,
     force_redownload: bool = False,
-):
-    lang_dir = os.path.join(out_dir, lang_code, split)
-    manifest_path = os.path.join(lang_dir, "manifest.csv")
-    if not force_redownload and os.path.exists(manifest_path):
-        with open(manifest_path, newline="", encoding="utf-8") as existing_file:
-            row_count = sum(1 for _ in csv.DictReader(existing_file))
-        if row_count >= n_samples:
-            print(f"Using existing samples for {lang_code} {split} at {manifest_path}")
-            return None, manifest_path
+) -> str:
+    target_dir = Path(samples_root) / language / split
+    manifest_path = _manifest_path(language, split, samples_root)
+    metadata_path = _metadata_path(language, split, samples_root)
 
-    print(f"Preparing samples for {lang_code} {split}...")
+    if not force_redownload and _existing_download_matches(
+        language=language,
+        split=split,
+        sample_count=sample_count,
+        min_seconds=min_seconds,
+        max_seconds=max_seconds,
+        seed=seed,
+        samples_root=samples_root,
+    ):
+        print(f"Using existing samples for {language} {split} at {manifest_path}")
+        return str(manifest_path)
 
-    # Load one FLEURS language config
+    print(
+        f"Preparing samples for {language} {split} "
+        f"({sample_count} clips, {min_seconds}-{max_seconds}s)..."
+    )
+
     try:
-        ds = load_dataset(
+        dataset = load_dataset(
             "google/fleurs",
-            lang_code,
+            language,
             split=split,
             trust_remote_code=True,
         )
@@ -167,34 +161,30 @@ def download_fleurs_samples(
     except ValueError as exc:
         if "trust_remote_code=True" in str(exc):
             raise RuntimeError(
-                "google/fleurs requires remote dataset code. This script now passes "
-                "`trust_remote_code=True`; if you still see this error, make sure "
-                "you are running the updated `main.py` from this directory."
+                "google/fleurs requires remote dataset code. Make sure you are "
+                "running the updated scripts from this directory."
             ) from exc
         raise
 
-    sampling_rate = ds.features["audio"].sampling_rate or 16000
-    ds = ds.cast_column("audio", Audio(sampling_rate=sampling_rate, decode=False))
-
-    # Filter by duration using metadata only so we don't decode audio for every row.
-    ds = ds.filter(
-        lambda x: min_seconds <= _duration_seconds(x, sampling_rate) <= max_seconds
+    sampling_rate = dataset.features["audio"].sampling_rate or 16000
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=sampling_rate, decode=False))
+    dataset = dataset.filter(
+        lambda row: min_seconds <= _duration_seconds(row, sampling_rate) <= max_seconds
     )
 
-    if len(ds) < n_samples:
+    if len(dataset) < sample_count:
         raise ValueError(
-            f"Only found {len(ds)} clips in {lang_code} {split} "
-            f"between {min_seconds} and {max_seconds} seconds."
+            f"Only found {len(dataset)} clips in {language} {split} between "
+            f"{min_seconds} and {max_seconds} seconds."
         )
 
-    # Random but reproducible selection
-    ds = ds.shuffle(seed=seed).select(range(n_samples))
+    dataset = dataset.shuffle(seed=seed).select(range(sample_count))
 
-    # Save files
-    os.makedirs(lang_dir, exist_ok=True)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    _clear_existing_audio_files(target_dir)
 
-    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+    with open(manifest_path, "w", newline="", encoding="utf-8") as manifest_file:
+        writer = csv.writer(manifest_file)
         writer.writerow(
             [
                 "sample_index",
@@ -207,66 +197,147 @@ def download_fleurs_samples(
             ]
         )
 
-        for i, row in enumerate(ds):
-            wav_path = os.path.join(lang_dir, f"{i:03d}_{row['id']}.wav")
+        for sample_index, row in enumerate(dataset):
+            audio_filename = f"{sample_index:03d}_{row['id']}.wav"
+            audio_path = target_dir / audio_filename
             audio_bytes = row["audio"]["bytes"]
             if not audio_bytes:
                 raise RuntimeError(
                     f"Missing embedded audio bytes for sample {row['id']}."
                 )
 
-            with open(wav_path, "wb") as wav_file:
-                wav_file.write(audio_bytes)
+            with open(audio_path, "wb") as audio_file:
+                audio_file.write(audio_bytes)
 
             writer.writerow(
                 [
-                    i,
+                    sample_index,
                     row["id"],
                     _duration_seconds(row, sampling_rate),
-                    wav_path,
+                    audio_filename,
                     row["transcription"],
                     row["raw_transcription"],
                     row["language"],
                 ]
             )
 
-    return ds, manifest_path
+    with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+        json.dump(
+            _expected_metadata(
+                language=language,
+                split=split,
+                sample_count=sample_count,
+                min_seconds=min_seconds,
+                max_seconds=max_seconds,
+                seed=seed,
+            ),
+            metadata_file,
+            indent=2,
+        )
+
+    print(f"Wrote manifest to {manifest_path}")
+    return str(manifest_path)
 
 
-def download_all_fleurs_samples(
-    split: str = "test",
-    min_seconds: float = 3.0,
-    max_seconds: float = 6.0,
-    n_samples: int = 30,
-    out_dir: str = "fleurs_samples",
-    seed: int = 42,
+def download_fleurs_samples_for_languages(
+    languages: Iterable[str],
+    split: str = DEFAULT_SPLIT,
+    min_seconds: float = DEFAULT_MIN_SECONDS,
+    max_seconds: float = DEFAULT_MAX_SECONDS,
+    sample_count: int = DEFAULT_SAMPLE_COUNT,
+    samples_root: str = DEFAULT_SAMPLES_ROOT,
+    seed: int = DEFAULT_RANDOM_SEED,
     force_redownload: bool = False,
-):
-    """Download FLEURS samples for all available languages."""
-    results = {}
-    for lang_code in TOP_10_SPOKEN_LANGUAGES:
+) -> Dict[str, str]:
+    results: Dict[str, str] = {}
+    for language in languages:
         try:
-            ds, manifest_path = download_fleurs_samples(
-                lang_code=lang_code,
+            results[language] = download_fleurs_samples(
+                language=language,
                 split=split,
                 min_seconds=min_seconds,
                 max_seconds=max_seconds,
-                n_samples=n_samples,
-                out_dir=out_dir,
+                sample_count=sample_count,
+                samples_root=samples_root,
                 seed=seed,
                 force_redownload=force_redownload,
             )
-            results[lang_code] = (ds, manifest_path)
-        except ValueError as e:
-            print(f"Skipping {lang_code}: {e}")
-            continue
+        except ValueError as exc:
+            print(f"Skipping {language}: {exc}")
     return results
 
 
-if __name__ == "__main__":
-    download_all_fleurs_samples(
-        split="test",
-        min_seconds=2,
-        max_seconds=10,
-        n_samples=30,
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download FLEURS samples that match the configured duration range."
     )
+    parser.add_argument(
+        "--language",
+        action="append",
+        dest="languages",
+        help="Language code to download. Repeat to download multiple languages.",
+    )
+    parser.add_argument(
+        "--split",
+        default=DEFAULT_SPLIT,
+        help=f"Dataset split to download. Default: {DEFAULT_SPLIT}.",
+    )
+    parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=DEFAULT_SAMPLE_COUNT,
+        help=f"Clips to download per language. Default: {DEFAULT_SAMPLE_COUNT}.",
+    )
+    parser.add_argument(
+        "--min-seconds",
+        type=float,
+        default=DEFAULT_MIN_SECONDS,
+        help=f"Minimum clip length. Default: {DEFAULT_MIN_SECONDS}.",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=DEFAULT_MAX_SECONDS,
+        help=f"Maximum clip length. Default: {DEFAULT_MAX_SECONDS}.",
+    )
+    parser.add_argument(
+        "--samples-root",
+        default=DEFAULT_SAMPLES_ROOT,
+        help=f"Directory for downloaded samples. Default: {DEFAULT_SAMPLES_ROOT}.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_RANDOM_SEED,
+        help=f"Random seed used for sample selection. Default: {DEFAULT_RANDOM_SEED}.",
+    )
+    parser.add_argument(
+        "--force-redownload",
+        action="store_true",
+        help="Redownload samples even if the existing manifest matches the request.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    languages = args.languages or list(DEFAULT_LANGUAGES)
+    if args.min_seconds > args.max_seconds:
+        raise ValueError("--min-seconds cannot be greater than --max-seconds.")
+    if args.sample_count <= 0:
+        raise ValueError("--sample-count must be greater than zero.")
+
+    download_fleurs_samples_for_languages(
+        languages=languages,
+        split=args.split,
+        min_seconds=args.min_seconds,
+        max_seconds=args.max_seconds,
+        sample_count=args.sample_count,
+        samples_root=args.samples_root,
+        seed=args.seed,
+        force_redownload=args.force_redownload,
+    )
+
+
+if __name__ == "__main__":
+    main()

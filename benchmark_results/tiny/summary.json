@@ -1,0 +1,13 @@
+{
+  "tiny": {
+    "samples": 300,
+    "successes": 298,
+    "failures": 2,
+    "mean_inference_time_sec": 0.6923798005799993,
+    "mean_rtf": 0.0960049140164496,
+    "mean_wer": 0.8278634005988194,
+    "mean_efficiency_score": 0.2052385919365638,
+    "best_efficiency_score": 0.843037819094968,
+    "peak_memory_mb": 108.234375
+  }
+}

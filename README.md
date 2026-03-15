@@ -1,20 +1,44 @@
-# FLEURS Benchmark Sampler
+# FLEURS + whisper.cpp Benchmarking
 
-This script downloads a small set of FLEURS audio clips, writes them as `.wav` files, and creates a `manifest.csv`.
-It also includes helpers for downloading Whisper.cpp model weights (GGML format) for fast inference on Apple Silicon.
-It now includes a benchmark runner for measuring Whisper accuracy, speed, memory, and failures using whisper.cpp with Core ML acceleration.
+This repo has three clean entry points:
 
-## Why the earlier error happened
+- `python3 download.py` downloads FLEURS clips and writes `manifest.csv` files.
+- `python3 download_models.py --model tiny` downloads `whisper.cpp` model binaries.
+- `python3 benchmark.py --model tiny` benchmarks a model with `whisper-cli`.
 
-`google/fleurs` still relies on a dataset loading script (`fleurs.py`), but `datasets` 4.x removed support for script-backed datasets. It also requires `trust_remote_code=True` when loading. If you have `datasets>=4`, `python3 main.py` fails with:
+## Defaults You Can Edit In Code
 
-`RuntimeError: Dataset scripts are no longer supported, but found fleurs.py`
+The default dataset shape and folder layout live in `config.py`.
+
+That is the file to change when you want a different standard setup for:
+
+- languages to download
+- split
+- minimum clip length
+- maximum clip length
+- clips per language
+- sample root directory
+- model directory
+- benchmark output root
+
+Current defaults are set through these constants:
+
+- `DEFAULT_LANGUAGES`
+- `DEFAULT_SPLIT`
+- `DEFAULT_MIN_SECONDS`
+- `DEFAULT_MAX_SECONDS`
+- `DEFAULT_SAMPLE_COUNT`
+- `DEFAULT_SAMPLES_ROOT`
+- `DEFAULT_MODELS_ROOT`
+- `DEFAULT_BENCHMARK_ROOT`
 
 ## Install
 
-### Prerequisites
+### whisper.cpp
 
-You must have **whisper.cpp** installed. On macOS with Homebrew:
+`benchmark.py` uses `whisper-cli`, so `whisper.cpp` must be installed and available on `PATH`.
+
+On macOS with Homebrew:
 
 ```bash
 brew install whisper-cpp
@@ -22,75 +46,96 @@ brew install whisper-cpp
 
 ### Python Dependencies
 
-Use the compatible dependency set:
-
 ```bash
 python3 -m pip install --user -r requirements.txt
 ```
 
-If you already installed the wrong version, force the downgrade:
+If `google/fleurs` fails because of the `datasets` version:
 
 ```bash
 python3 -m pip install --user --upgrade --force-reinstall "datasets<4"
 ```
 
-## Run
+## Download FLEURS Samples
 
-From this directory:
+Use the defaults from `config.py`:
 
 ```bash
 python3 download.py
 ```
 
-That downloads 30 samples for the top 10 spoken languages from the `test` split into:
+Override them from the CLI when needed:
 
-```text
-fleurs_samples/
-  cmn_hans_cn/test/
-  es_419/test/
-  en_us/test/
-  hi_in/test/
-  ar_eg/test/
-  pt_br/test/
-  bn_in/test/
-  ru_ru/test/
-  ja_jp/test/
-  pa_in/test/
+```bash
+python3 download.py --language en_us --language ja_jp --sample-count 20 --min-seconds 3 --max-seconds 8
 ```
 
-Each folder will contain `.wav` files plus `manifest.csv`.
+The downloader stores data under:
 
-If a language already has a `manifest.csv` with at least the requested number of rows, `python3 download.py` reuses those samples instead of downloading them again.
+```text
+fleurs_samples/<language>/<split>/
+```
 
-## Download Whisper Models
+Each folder contains:
 
-This project uses **whisper.cpp** with GGML format models for fast inference on Apple Silicon (with Core ML acceleration).
+- `manifest.csv`
+- `download_config.json`
+- downloaded `.wav` files
 
-Download the GGML models:
+The downloader reuses an existing language/split only when the saved download settings still match the requested settings. If you change clip count or duration bounds, it refreshes that manifest automatically.
+
+Use `--force-redownload` to rebuild a language/split even when the config matches.
+
+## Download whisper.cpp Models
+
+Download one model:
 
 ```bash
 python3 download_models.py --model tiny
-python3 download_models.py --model large
 ```
 
-`python3 download.py` does not download Whisper models. Dataset downloads and model downloads are separate commands.
-
-To download all supported models at once:
+Download multiple:
 
 ```bash
-python3 download_models.py
+python3 download_models.py --model tiny --model large
 ```
 
-Each model is stored as a `.bin` file under:
+If you run `download_models.py` with no `--model`, it downloads every supported model.
 
-```text
-whisper_models/
-  ggml-tiny.bin
-  ggml-large-v3.bin
+Supported model names are defined in `whisper_cpp.py`.
+
+## Fine-Tune A Whisper Model
+
+Fine-tuning is not a `whisper.cpp` operation. The usual flow is:
+
+1. Fine-tune a Hugging Face Whisper checkpoint with PyTorch.
+2. Evaluate the resulting checkpoint.
+3. Convert that trained checkpoint later if you want to run it through `whisper.cpp`.
+
+This repo now includes a simple training script:
+
+```bash
+python3 finetune_whisper.py \
+  --train-manifest fleurs_samples/en_us/test/manifest.csv \
+  --base-model openai/whisper-tiny \
+  --language English \
+  --output-dir finetuned_models/en-us-tiny
 ```
 
-**Note:** Old PyTorch models (`.pt` files) are automatically cleaned up when you run the new download functions.
-The model downloader uses the official `ggerganov/whisper.cpp` files on Hugging Face and retries transient network failures automatically.
+If you do not pass `--eval-manifest`, the script automatically holds out part of the training set for evaluation.
+
+Training dependencies are kept separate from the benchmark dependencies:
+
+```bash
+python3 -m pip install --user -r requirements-finetune.txt
+```
+
+The fine-tune script reads the same `manifest.csv` files created by `download.py`, so you can:
+
+1. Change defaults in `config.py` if you want a different clip count or duration range.
+2. Run `python3 download.py` to refresh your dataset.
+3. Run `python3 finetune_whisper.py ...` to train a Hugging Face Whisper checkpoint.
+4. Run `python3 benchmark.py --model ...` for the stock `whisper.cpp` models already supported here.
 
 ## Run Benchmarks
 
@@ -100,67 +145,54 @@ Benchmark one model:
 python3 benchmark.py --model tiny
 ```
 
+Benchmark a specific manifest only:
+
+```bash
+python3 benchmark.py --model tiny --manifest fleurs_samples/en_us/test/manifest.csv
+```
+
 Benchmark multiple models:
 
 ```bash
 python3 benchmark.py --model tiny --model large
 ```
 
-By default, the benchmark scans every `manifest.csv` under:
+By default, `benchmark.py` scans every `manifest.csv` under `fleurs_samples/`.
 
-```text
-fleurs_samples/
-```
+During the run, the terminal prints:
 
-If you want to benchmark only one manifest, pass it explicitly:
+- model start and finish
+- manifest progress
+- per-sample progress
 
-```bash
-python3 benchmark.py --model tiny --manifest fleurs_samples/en_us/test/manifest.csv
-```
+## Benchmark Outputs
 
-Outputs are written to:
+Benchmark outputs are now written per model under the benchmark root:
 
 ```text
 benchmark_results/
+  tiny/
+    benchmark_results.csv
+    summary.json
+    wer_vs_rtf.png
+    memory_vs_rtf.png
+    accuracy_and_time_by_audio_length.png
+    accuracy_ranking.png
+    success_vs_failure.png
+    inference_time_by_duration_bucket.png
+  large/
+    ...
 ```
 
-The benchmark produces:
+If you pass `--output-dir custom_results`, the model outputs go to:
 
-- `benchmark_results.csv`
-- `summary.json`
-- `wer_vs_rtf.png`
-- `memory_vs_rtf.png`
-- `accuracy_and_time_by_audio_length.png`
-- `accuracy_ranking.png`
-- `success_vs_failure.png`
-- `inference_time_by_duration_bucket.png`
+```text
+custom_results/<model_name>/
+```
 
-Tracked metrics:
+## Workflow
 
-- Inference time per sample
-- Real-time factor (RTF)
-- WER against the manifest transcription
-- Efficiency score: `(1 - WER) / (1 + RTF)` so higher means a better speed/accuracy tradeoff
-- Peak memory usage (RSS)
-- Failure count for exceptions and empty outputs
-
-Benchmark notes:
-
-- `benchmark.py` uses the same GGML model paths as [`download.py`](/Users/jude/xp/vorn/benchmarks/download.py).
-- If a requested model file is missing, the benchmark resolves it through the downloader path instead of using a separate hard-coded mapping.
-- `whisper-cli` from `whisper.cpp` must be installed and available on `PATH`.
-
-## Features
-
-- **Apple Silicon Acceleration**: Automatically uses Core ML for 3-4x faster inference on M1/M2/M3/M4 Macs
-- **Auto Language Detection**: whisper.cpp automatically detects the spoken language for each sample
-- **GGML Format**: Uses optimized binary models instead of PyTorch checkpoints
-- **Top 10 Languages**: Benchmarks the 10 most spoken languages in the world
-
-## Notes
-
-- Importing `download.py` does not download anything. The download only runs when the file is executed directly.
-- Clip duration filtering uses each audio item's declared sample rate instead of assuming `16000`.
-- The script explicitly enables `trust_remote_code=True` for `google/fleurs`, because that dataset is distributed with a loader script on Hugging Face.
-- Audio files are written from the dataset-provided WAV bytes directly, so no extra audio decoding libraries are required.
-- Supported models: `tiny`, `large` (whisper.cpp GGML format)
+1. Edit `config.py` if you want a new default sample count or clip duration range.
+2. Run `python3 download.py` to fetch or refresh manifests that match those settings.
+3. Run `python3 download_models.py --model <model>` to fetch the `whisper.cpp` binary model.
+4. Run `python3 benchmark.py --model <model>` to benchmark that model and write results into its own folder.

@@ -1,6 +1,11 @@
 import argparse
 
-from download import WHISPER_MODEL_NAMES, download_all_whisper_models, download_whisper_model
+from config import DEFAULT_MODELS_ROOT
+from whisper_cpp import (
+    WHISPER_MODEL_NAMES,
+    download_all_whisper_models,
+    download_whisper_model,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -15,8 +20,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--out-dir",
-        default="whisper_models",
-        help="Directory where GGML model files should be stored.",
+        default=DEFAULT_MODELS_ROOT,
+        help=f"Directory where GGML model files should be stored. Default: {DEFAULT_MODELS_ROOT}.",
     )
     return parser.parse_args()
 
